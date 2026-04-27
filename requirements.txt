@@ -1,0 +1,7 @@
+langgraph
+langchain-core
+langchain-anthropic
+langchain-deepseek
+python-dotenv
+pydantic
+streamlit
