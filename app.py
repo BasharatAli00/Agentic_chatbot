@@ -83,10 +83,7 @@ with chat_container:
         with st.chat_message(msg["role"]):
             render_message(msg["content"], msg["role"])
 
-    # Thinking indicator
-    if st.session_state.thinking:
-        with st.chat_message("assistant"):
-            render_thinking()
+
 
 # ── INPUT BAR ────────────────────────────────────────────
 if prompt := st.chat_input("Ask anything… (Shift+Enter for new line)"):
@@ -107,15 +104,20 @@ if st.session_state.thinking:
     )
     if last_user_msg:
         try:
-            response = run_graph(
-                message=last_user_msg["content"],
-                thread_id=st.session_state.thread_id,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
+            with st.chat_message("assistant"):
+                # Use st.write_stream to handle the generator and display tokens in real-time
+                response_generator = run_graph(
+                    message=last_user_msg["content"],
+                    thread_id=st.session_state.thread_id,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                full_response = st.write_stream(response_generator)
+                
+            # Store the final string, NOT the generator
             st.session_state.messages.append({
                 "role": "assistant",
-                "content": response,
+                "content": full_response,
                 "timestamp": datetime.now().strftime("%H:%M"),
             })
         except Exception as e:

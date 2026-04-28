@@ -42,7 +42,8 @@ def run_graph(
     thread_id: str,
     temperature: float = 0.7,
     max_tokens: int = 1024,
-) -> str:
+):
+
     config = {
         "configurable": {
             "thread_id": thread_id,
@@ -50,8 +51,17 @@ def run_graph(
             "max_tokens": max_tokens,
         }
     }
-    result = graph.invoke(
+    for msg, metadata in graph.stream(
         {"messages": [HumanMessage(content=message)]},
         config=config,
-    )
-    return result["messages"][-1].content
+        stream_mode="messages",
+    ):
+        if msg.content:
+            yield msg.content
+
+if __name__ == "__main__":
+    for token in run_graph(
+        "Hello, write 220 word blog on cricket",
+        "thread_1"
+    ):
+        print(token, end="", flush=True)
