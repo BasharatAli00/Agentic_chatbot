@@ -5,3 +5,8 @@ langchain-deepseek
 python-dotenv
 pydantic
 streamlit
+langchain-community
+duckduckgo-search
+numexpr
+fastapi
+uvicorn
