@@ -5,10 +5,17 @@ from pydantic import BaseModel
 from typing import List, Optional
 import json
 import asyncio
-# Changed from backend.graph to .graph since main.py is now inside backend/
-from .graph import run_graph, get_chat_history, get_all_threads
+import sys
+
+# Windows + Python 3.12 compatibility
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+from graph import run_graph, get_chat_history, get_all_threads
 
 app = FastAPI(title="Agentic Chatbot API")
+
+# Global graph initialization removed to ensure fresh lifecycle per request
 
 # Enable CORS for Next.js frontend
 app.add_middleware(
@@ -29,8 +36,8 @@ class ChatRequest(BaseModel):
 async def chat_endpoint(request: ChatRequest):
     async def event_generator():
         try:
-            # run_graph is a generator yielding dictionaries
-            for chunk in run_graph(
+            # run_graph is now an async generator
+            async for chunk in run_graph(
                 message=request.message,
                 thread_id=request.thread_id,
                 temperature=request.temperature,
@@ -48,13 +55,24 @@ async def chat_endpoint(request: ChatRequest):
 @app.get("/api/history/{thread_id}")
 async def history_endpoint(thread_id: str):
     try:
-        history = get_chat_history(thread_id)
+        history = await get_chat_history(thread_id)
         # Convert LangChain messages to simple dicts for the frontend
         formatted_history = []
         for m in history:
             role = "user" if m.type == "human" else "assistant"
             if m.content:
-                formatted_history.append({"role": role, "content": m.content})
+                text_content = ""
+                if isinstance(m.content, str):
+                    text_content = m.content
+                elif isinstance(m.content, list):
+                    for block in m.content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text_content += block.get("text", "")
+                        elif isinstance(block, str):
+                            text_content += block
+                
+                if text_content:
+                    formatted_history.append({"role": role, "content": text_content})
         return formatted_history
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -62,7 +80,7 @@ async def history_endpoint(thread_id: str):
 @app.get("/api/threads")
 async def threads_endpoint():
     try:
-        threads = get_all_threads()
+        threads = await get_all_threads()
         return {"threads": threads}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

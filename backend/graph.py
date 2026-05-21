@@ -1,4 +1,4 @@
-from langchain_deepseek import ChatDeepSeek
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langgraph.graph import StateGraph, END, START
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -10,13 +10,76 @@ import sqlite3
 from typing import TypedDict, Annotated
 from langchain_core.messages import BaseMessage, AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter# from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_community.vectorstores import FAISS
 import os
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 
+import asyncio
+from langchain_mcp_adapters.client import MultiServerMCPClient
+
 # ── Tools Definition ─────────────────────────────────────
+
+
+
+
+
+# ── RAG Setup ─────────────────────────────────────────────
+_retriever = None
+
+def get_retriever():
+    """Initializes the FAISS vector store once and caches the retriever."""
+    global _retriever
+    if _retriever is None:
+        PDF_PATH = "how_to_talk_to_anyone.pdf"
+        if not os.path.exists(PDF_PATH):
+            print(f"Warning: {PDF_PATH} not found. RAG tool will be unavailable.")
+            return None
+        
+        print(f"Initializing RAG retriever from {PDF_PATH}...")
+        try:
+            emb = OpenAIEmbeddings(model="text-embedding-3-large")
+            loader = PyPDFLoader(PDF_PATH)
+            docs = loader.load()
+            splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+            splits = splitter.split_documents(docs)
+            vs = FAISS.from_documents(splits, emb)
+            _retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": 4})
+        except Exception as e:
+            print(f"Error initializing RAG: {e}")
+            return None
+    return _retriever
+
+@tool
+async def rag_node(query: str):
+    """
+    Search relevant context from the 'how_to_talk.pdf' document for the given query.
+    Returns snippets from the document and their metadata.
+    """
+    retriever = get_retriever()
+    if retriever is None:
+        return {"error": "RAG retriever is not available (PDF missing or initialization failed)."}
+        
+    result = await retriever.ainvoke(query)
+    return {
+        "query": query,
+        "context": [doc.page_content for doc in result],
+        "metadata": [doc.metadata for doc in result]
+    }
+
+
+
+
+
+
+# 4) Prompt
+    
+
+    
 search = DuckDuckGoSearchRun()
 
 @tool
@@ -30,111 +93,179 @@ def calculator(expression: str) -> str:
     except Exception as e:
         return f"Error evaluating expression: {str(e)}"
 
-tools = [search, calculator]
-tool_node = ToolNode(tools)
+# MCP Setup
+MCP_SERVER_PATH = os.getenv("MCP_SERVER_PATH")
+FASTMCP_EXE_PATH = os.getenv("FASTMCP_EXE_PATH")
+
+mcp_server_config = {
+    "gas_tracker": {
+        "transport": "stdio",
+        "command": FASTMCP_EXE_PATH,
+        "args": ["run", MCP_SERVER_PATH]
+    }
+}
+
+# Global client and tools list
+mcp_client = None
+mcp_tools = []
+
+async def get_all_tools():
+    global mcp_client, mcp_tools
+    
+    if mcp_client == "FAILED":
+        return [search, calculator]
+
+    mcp_path = os.getenv("MCP_SERVER_PATH")
+    mcp_exe = os.getenv("FASTMCP_EXE_PATH")
+    
+    if not mcp_path or not mcp_exe:
+        return [search, calculator,rag_node]
+
+    if mcp_client is None:
+        try:
+            config = {
+                "gas_tracker": {
+                    "transport": "stdio",
+                    "command": mcp_exe,
+                    "args": ["run", mcp_path]
+                }
+            }
+            mcp_client = MultiServerMCPClient(config)
+            # MultiServerMCPClient version 0.1.0+ does not support __aenter__
+            # It connects automatically on first use or via get_tools()
+            mcp_tools = await asyncio.wait_for(mcp_client.get_tools(), timeout=30.0)
+        except Exception as e:
+            print(f"MCP Disabled: {e}")
+            mcp_tools = []
+            mcp_client = "FAILED" 
+    
+    return [search, calculator,rag_node] + (mcp_tools if isinstance(mcp_tools, list) else [])
 
 # ── State ────────────────────────────────────────────────
 class chatstate(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
 
 # ── LLM Node ─────────────────────────────────────────────
-def chat_llm(state: chatstate, config: RunnableConfig) -> chatstate:
-    llm = ChatDeepSeek(
-        model="deepseek-chat",
-        api_key=os.environ.get("DEEPSEEK_API_KEY"),
-        temperature=config.get("configurable", {}).get("temperature", 0.7),
-        max_tokens=config.get("configurable", {}).get("max_tokens", 1024),
-    ).bind_tools(tools)
+async def chat_llm(state: chatstate, config: RunnableConfig) -> chatstate:
+    try:
+        current_tools = await get_all_tools()
+        
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        
+        if current_tools:
+            llm = llm.bind_tools(current_tools)
+        
+        # --- DeepSeek/Strict API Fix ---
+        # Ensure history doesn't have "hanging" tool calls (AI messages with tool_calls
+        # not followed by ToolMessages). This happens if a previous run was interrupted.
+        messages = state["messages"]
+        cleaned_messages = []
+        for i, msg in enumerate(messages):
+            if isinstance(msg, AIMessage) and msg.tool_calls:
+                # Check if the very next message is a ToolMessage or if this is the last message
+                # If a HumanMessage follows a tool call directly, it's invalid for DeepSeek.
+                is_last = (i == len(messages) - 1)
+                is_followed_by_human = (not is_last and isinstance(messages[i+1], HumanMessage))
+                
+                if is_followed_by_human:
+                    # Convert to a plain AI message to satisfy API constraints
+                    cleaned_messages.append(AIMessage(content=msg.content or "System: Tool calls were interrupted."))
+                    continue
+            cleaned_messages.append(msg)
+        # --- End Fix ---
+
+        response = await llm.ainvoke(cleaned_messages, config=config)
+        return {"messages": [response]}
+    except Exception as e:
+        print(f"Error in chat_llm: {e}")
+        return {"messages": [AIMessage(content=f"Error: {str(e)}")]}
+
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+# ── Graph Factory ─────────────────────────────────────────
+async def create_graph(checkpointer):
+    """Factory function to create a fresh graph instance."""
+    builder = StateGraph(chatstate)
+    builder.add_node("chat_llm", chat_llm)
     
-    # Pass config to llm.invoke to propagate metadata for LangSmith
-    response = llm.invoke(state["messages"], config=config)
-    return {"messages": [response]}
+    async def tools_node_wrapper(state: chatstate, config: RunnableConfig):
+        current_tools = await get_all_tools()
+        node = ToolNode(current_tools)
+        return await node.ainvoke(state, config=config)
 
-# ── Graph Assembly ────────────────────────────────────────
-conn = sqlite3.connect("chatbot.db", check_same_thread=False)
-memory = SqliteSaver(conn)
-
-builder = StateGraph(chatstate)
-builder.add_node("chat_llm", chat_llm)
-builder.add_node("tools", tool_node)
-
-builder.set_entry_point("chat_llm")
-
-# Add conditional edges to handle tool calling
-builder.add_conditional_edges(
-    "chat_llm",
-    tools_condition,
-)
-
-# Tools always return to the LLM
-builder.add_edge("tools", "chat_llm")
-
-graph = builder.compile(checkpointer=memory)
+    builder.add_node("tools", tools_node_wrapper)
+    builder.set_entry_point("chat_llm")
+    builder.add_conditional_edges("chat_llm", tools_condition)
+    builder.add_edge("tools", "chat_llm")
+    
+    return builder.compile(checkpointer=checkpointer)
 
 # ── Public Function ───────────────────────────────────────
-def run_graph(
+async def run_graph(
     message: str,
     thread_id: str,
     temperature: float = 0.7,
     max_tokens: int = 1024,
 ):
-    config = {
-        "configurable": {
-            "thread_id": thread_id,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        },
-        "metadata": {
-            "thread_id": thread_id,
-            "session_id": thread_id
+    # Create fresh checkpointer and graph inside a single async scope
+    async with AsyncSqliteSaver.from_conn_string("chatbot.db") as saver:
+        graph_inst = await create_graph(saver)
+        
+        config = {
+            "configurable": {
+                "thread_id": thread_id,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
         }
-    }
-    
-    # We use multiple stream modes to get both message tokens and node updates
-    for mode, data in graph.stream(
-        {"messages": [HumanMessage(content=message)]},
-        config=config,
-        stream_mode=["messages", "updates"],
-    ):
-        if mode == "messages":
-            msg, metadata = data
-            if isinstance(msg, AIMessage) and msg.content:
-                yield {"type": "text", "content": msg.content}
-        elif mode == "updates":
-            # If the 'tools' node is in the update, it means a tool was just called
-            if "tools" in data:
-                yield {"type": "tool", "status": "executing"}
-            # If 'chat_llm' is in the update, we can check for tool calls
-            elif "chat_llm" in data:
-                msg = data["chat_llm"]["messages"][-1]
-                if msg.tool_calls:
-                    tool_names = [tc["name"] for tc in msg.tool_calls]
-                    yield {"type": "tool_call", "names": tool_names}
+        
+        async for mode, data in graph_inst.astream(
+            {"messages": [HumanMessage(content=message)]},
+            config=config,
+            stream_mode=["updates"],
+        ):
+            if mode == "updates":
+                if "chat_llm" in data:
+                    msg = data["chat_llm"]["messages"][-1]
+                    
+                    # 1. Handle Tool Calls
+                    if hasattr(msg, "tool_calls") and msg.tool_calls:
+                        tool_names = [tc["name"] for tc in msg.tool_calls]
+                        yield {"type": "tool_call", "names": tool_names}
+                    
+                    # 2. Handle Text Content
+                    if msg.content:
+                        text = ""
+                        if isinstance(msg.content, str):
+                            text = msg.content
+                        elif isinstance(msg.content, list):
+                            for block in msg.content:
+                                if isinstance(block, dict) and block.get("type") == "text":
+                                    text += block.get("text", "")
+                                elif isinstance(block, str):
+                                    text += block
+                        if text:
+                            yield {"type": "text", "content": text}
+                
+                elif "tools" in data:
+                    yield {"type": "tool", "status": "executing"}
 
-def get_chat_history(thread_id: str):
-    """Retrieve existing message history for a specific thread."""
-    config = {
-        "configurable": {"thread_id": thread_id},
-        "metadata": {"thread_id": thread_id, "session_id": thread_id}
-    }
-    state = graph.get_state(config)
-    if state.values:
-        return state.values.get("messages", [])
-    return []
-
-def get_all_threads():
-    """List all unique thread IDs stored in the SQLite database."""
-    try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT DISTINCT thread_id FROM checkpoints")
-        return [row[0] for row in cursor.fetchall()]
-    except sqlite3.OperationalError:
+async def get_chat_history(thread_id: str):
+    async with AsyncSqliteSaver.from_conn_string("chatbot.db") as saver:
+        graph_inst = await create_graph(saver)
+        config = {"configurable": {"thread_id": thread_id}}
+        state = await graph_inst.aget_state(config)
+        if state.values:
+            return state.values.get("messages", [])
         return []
 
-if __name__ == "__main__":
-    # Test with a search query
-    for token in run_graph(
-        "Who is the current Prime Minister of Pakistan and what is 25 * 4?",
-        "thread_test"
-    ):
-        print(token, end="", flush=True)
+async def get_all_threads():
+    try:
+        import aiosqlite
+        async with aiosqlite.connect("chatbot.db") as db:
+            async with db.execute("SELECT DISTINCT thread_id FROM checkpoints") as cursor:
+                rows = await cursor.fetchall()
+                return [row[0] for row in rows]
+    except Exception as e:
+        print(f"Error fetching threads: {e}")
+        return []

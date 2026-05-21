@@ -1,7 +1,5 @@
 langgraph
 langchain-core
-langchain-anthropic
-langchain-deepseek
 python-dotenv
 pydantic
 streamlit
@@ -10,3 +8,8 @@ duckduckgo-search
 numexpr
 fastapi
 uvicorn
+langchain-mcp-adapters
+aiosqlite
+faiss-cpu
+pypdf
+langchain-openai
