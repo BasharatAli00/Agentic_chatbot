@@ -1,12 +1,10 @@
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langgraph.graph import StateGraph, END, START
 from langgraph.graph.message import add_messages
-from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_community.tools import DuckDuckGoSearchRun
 from langchain_core.tools import tool
 import numexpr
-import sqlite3
 from typing import TypedDict, Annotated
 from langchain_core.messages import BaseMessage, AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
@@ -180,7 +178,10 @@ async def chat_llm(state: chatstate, config: RunnableConfig) -> chatstate:
         print(f"Error in chat_llm: {e}")
         return {"messages": [AIMessage(content=f"Error: {str(e)}")]}
 
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+import os
+
+DB_URL = os.getenv("DATABASE_URL", "postgresql://chatbot:chatbot_password@postgres:5432/chatbot_db")
 
 # ── Graph Factory ─────────────────────────────────────────
 async def create_graph(checkpointer):
@@ -208,7 +209,8 @@ async def run_graph(
     max_tokens: int = 1024,
 ):
     # Create fresh checkpointer and graph inside a single async scope
-    async with AsyncSqliteSaver.from_conn_string("chatbot.db") as saver:
+    async with AsyncPostgresSaver.from_conn_string(DB_URL) as saver:
+        await saver.setup()
         graph_inst = await create_graph(saver)
         
         config = {
@@ -251,7 +253,8 @@ async def run_graph(
                     yield {"type": "tool", "status": "executing"}
 
 async def get_chat_history(thread_id: str):
-    async with AsyncSqliteSaver.from_conn_string("chatbot.db") as saver:
+    async with AsyncPostgresSaver.from_conn_string(DB_URL) as saver:
+        await saver.setup()
         graph_inst = await create_graph(saver)
         config = {"configurable": {"thread_id": thread_id}}
         state = await graph_inst.aget_state(config)
@@ -261,11 +264,13 @@ async def get_chat_history(thread_id: str):
 
 async def get_all_threads():
     try:
-        import aiosqlite
-        async with aiosqlite.connect("chatbot.db") as db:
-            async with db.execute("SELECT DISTINCT thread_id FROM checkpoints") as cursor:
-                rows = await cursor.fetchall()
-                return [row[0] for row in rows]
+        import asyncpg
+        conn = await asyncpg.connect(DB_URL)
+        try:
+            rows = await conn.fetch("SELECT DISTINCT thread_id FROM checkpoints")
+            return [row['thread_id'] for row in rows]
+        finally:
+            await conn.close()
     except Exception as e:
         print(f"Error fetching threads: {e}")
         return []

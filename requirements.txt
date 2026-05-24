@@ -4,12 +4,14 @@ python-dotenv
 pydantic
 streamlit
 langchain-community
-duckduckgo-search
+ddgs
 numexpr
 fastapi
 uvicorn
 langchain-mcp-adapters
-aiosqlite
+asyncpg
+psycopg[binary,pool]
+langgraph-checkpoint-postgres
 faiss-cpu
 pypdf
 langchain-openai
